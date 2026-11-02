@@ -12628,7 +12628,7 @@ function vDash() {
   ${empty ? `<div class="card" style="margin-bottom:16px"><h2>Get started</h2><p class="muted">Add your plate stock, add parts (or upload DXF), nest, and confirm the cut. Every usable leftover is saved as a labelled offcut and used first on the next order.</p>
   <div class="row"><button class="btn p" data-act="view" data-v="stock">Add plate stock</button><button class="btn" data-act="demo">Load demo data</button></div></div>` : ''}
   <div class="grid g4">
-    <div class="card kpi"><div class="l">Plates in stock</div><div class="v">${t.stockPlates}</div></div>
+    <div class="card kpi"><div class="l">Plates in stock</div><div class="v">${t.stockPlates}</div><div class="s">${list.length > 1 ? 'total across ' + list.length + ' materials — see table below' : ''}</div></div>
     <div class="card kpi" id="kpi-scrap"><div class="l">Scrap</div><div class="v" style="color:var(--bad)">${area(t.scrapArea)}</div><div class="s">${t.scrapValue ? inr(t.scrapValue) + ' lost' : ''}</div></div>
     <div class="card kpi"><div class="l">Utilisation</div><div class="v">${t.jobs ? pct(t.util) : '—'}</div></div>
     <div class="card kpi"><div class="l">Money saved</div><div class="v" style="color:var(--ok)">${inr(t.saved)}</div></div>
