@@ -11745,9 +11745,10 @@ Engine.prototype.finishRes = function (used, remaining) {
   const fill = used.map(u => Math.round(u.SS.placed.reduce((a, q) => a + P.types[q.t].area, 0) ));
   // exact outlines beat the bounding-box layout on a tie
   // strip objective: length first, then the mean right edge of the parts (gives the search a gradient across layouts of equal length)
-  let tail = [whole ? -pieces : 0, Math.round(leftS / (0.001 * totA || 1)), -comp]; // saved leftover area (net utilisation) in 0.1 % steps before compactness
+  let tail = [Math.round(leftS / (0.001 * totA || 1)), -comp]; // saved leftover area (net utilisation) in 0.1 % steps before compactness
   if (st.objective === 'strip') { let sx = 0, n = 0; for (const u of used) for (const q of u.SS.placed) { sx += (q.X + this.shape(q.t, q.deg).bb.maxX) / S; n++; } tail = [-Math.round(comp * 20) / 20, -(n ? sx / n : 0)]; }
-  const key = [placed, -Math.round(newPlate), -used.length, -Math.round(tot)].concat(st.objective === 'strip' ? [] : fill, [this.box ? 0 : 1], tail);
+  // keep the plate whole: fewer separate leftover pieces outrank everything below (a denser sheet that fragments the remainder loses), then part area per sheet in order
+  const key = [placed, -Math.round(newPlate), -used.length, -Math.round(tot)].concat(st.objective === 'strip' ? [] : [whole ? -pieces : 0].concat(fill), [this.box ? 0 : 1], tail);
   return { key, sheets: used.map(u => ({ si: u.si, rank: u.rank, pl: u.SS.placed.map(q => [q.inst, q.t, q.deg, q.X, q.Y, q.owner]), pieces: u.info.pieces, freeRect: u.info.freeRect, env: u.SS.env })), unplaced: remaining };
 };
 /* generator for a search task: normal individual, bounding-box individual (ind.box) or repair of a layout (ind.base) */
