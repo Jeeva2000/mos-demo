@@ -84,6 +84,7 @@ dl.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:8px 0 0;fo
 .np-bar{height:5px;background:#eef2f7;border-radius:3px;margin-top:9px;overflow:hidden}.np-bar i{display:block;height:100%;background:var(--acc);transition:width .25s linear}
 @media print{.nest-progress,#toasts,.store-banner{display:none!important}}
 .modal td.mono{white-space:nowrap}
+.so{display:inline-flex;flex-direction:column;gap:4px}.so input[hidden]{display:none}
 </style></head>
 <body>
 <aside><div class="brand"><div class="logo">MOS</div><div><b>Manufacturing OS</b><small>Offcut tracker · v0.5</small></div></div>
@@ -12648,15 +12649,22 @@ function vDash() {
 
 const FINISHES = ['Mill finish', 'Hot rolled / pickled & oiled', 'Cold rolled', '2B', 'Brushed #4', 'Galvanised', 'Anodised', 'PVC film one side', 'Gloss', 'Matte', '3K twill gloss', '3K twill matte', 'UD matte'];
 const SHEET_PRESETS = [['', 'Standard size…'], ['2500x1250', '2500 × 1250 mm'], ['3000x1500', '3000 × 1500 mm'], ['4000x2000', '4000 × 2000 mm'], ['2440x1220', '2440 × 1220 mm (8 × 4 ft)'], ['2438.4x1219.2', '96 × 48 in'], ['3048x1524', '120 × 60 in'], ['3657.6x1524', '144 × 60 in'], ['500x500', '500 × 500 mm'], ['600x400', '600 × 400 mm']];
+const MATERIALS = ['Carbon fibre', 'Stainless 304', 'Stainless 316', 'Mild steel', 'Galvanised steel', 'Aluminium 5052', 'Aluminium 6082', 'Brass', 'Copper', 'G10 / FR4'];
+// A real dropdown (not a datalist, which hides every option but the one already typed) with an "Other…" escape hatch.
+function selOther(name, value, options, opt) {
+  opt = opt || {}; const list = options.filter((v, i, a) => v && a.indexOf(v) === i); const known = list.some(o => o.toLowerCase() === String(value || '').toLowerCase());
+  const empty = !String(value || '').trim(); const cur = known ? list.find(o => o.toLowerCase() === String(value).toLowerCase()) : (empty && opt.none ? '' : '__other');
+  return `<span class="so"><select data-act="so-select" data-for="${name}" class="w-l">${opt.none ? `<option value=""${cur === '' ? ' selected' : ''}>${esc(opt.none)}</option>` : ''}${list.map(o => `<option value="${esc(o)}"${o === cur ? ' selected' : ''}>${esc(o)}</option>`).join('')}<option value="__other"${cur === '__other' ? ' selected' : ''}>Other…</option></select><input name="${name}" value="${esc(value || '')}" placeholder="${esc(opt.ph || 'Type a name')}" class="w-l"${cur === '__other' ? '' : ' hidden'}></span>`;
+}
 const STOCK_FORM0 = { material: 'Mild steel', thickness: '3', finish: '', w: '2500', h: '1250', qty: '5', cost: '' };
 function vStock() {
   const fin = finishes(), F = Object.assign({}, STOCK_FORM0, S.ui.stockForm || {}), mats = [...new Set(['Mild steel', 'Stainless 304', 'Stainless 316', 'Aluminium 5052', 'Aluminium 6082', 'Galvanised steel', 'Brass', 'Copper', 'Carbon fibre', 'G10 / FR4'].concat(S.stock.map(s => s.material)))];
   const ni = (name, val, cls, mode) => `<input name="${name}" type="text" inputmode="${mode || 'decimal'}" autocomplete="off" value="${esc(val)}" class="num ${cls || ''}">`;
   return `<h1>Plate stock</h1><p class="sub">Full plates you buy. Any size, any thickness. Cost is used to value offcuts. Decimals can be typed as 1.5 or 1,5.</p>
   <div class="card"><h2>Add plates</h2><form id="f-stock" class="row" novalidate>
-    <label class="f">Material<input name="material" list="mat-list" value="${esc(F.material)}" placeholder="e.g. Mild steel" class="w-l"><datalist id="mat-list">${mats.map(m => `<option value="${esc(m)}">`).join('')}</datalist></label>
+    <label class="f">Material${selOther('material', F.material, MATERIALS.concat(S.stock.map(s => s.material)), { ph: 'e.g. Titanium grade 2' })}</label>
     <label class="f">Thickness (mm)${ni('thickness', F.thickness)}</label>
-    <label class="f">Finish<input name="finish" list="fin-list" value="${esc(F.finish)}" placeholder="e.g. 2B, mill, 3K twill" class="w-l"><datalist id="fin-list">${FINISHES.concat(fin).filter((v, i, a) => a.indexOf(v) === i).map(f => `<option value="${esc(f)}">`).join('')}</datalist></label>
+    <label class="f">Finish${selOther('finish', F.finish, FINISHES.concat(fin), { none: 'None / not specified', ph: 'Type a finish' })}</label>
     <label class="f">Size preset<select data-act="stock-preset">${SHEET_PRESETS.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select></label>
     <label class="f">Width (mm)${ni('w', F.w)}</label>
     <label class="f">Height (mm)${ni('h', F.h)}</label>
@@ -13082,9 +13090,9 @@ function showEditOffcut(id) {
   const rect = o.loops.length === 1 && o.loops[0].length === 4 && (() => { const b = MOS.bboxOf([o.loops[0]]); return o.loops[0].every(p => (Math.abs(p[0] - b.minX) < 1e-6 || Math.abs(p[0] - b.maxX) < 1e-6) && (Math.abs(p[1] - b.minY) < 1e-6 || Math.abs(p[1] - b.maxY) < 1e-6)); })();
   const bg = document.createElement('div'); bg.className = 'modal-bg'; bg.id = 'edit-modal';
   bg.innerHTML = `<div class="modal" style="max-width:560px"><h2>Edit ${esc(o.id)}</h2><form id="f-oc-edit" data-id="${esc(o.id)}" class="row" novalidate>
-    <label class="f">Material<input name="material" value="${esc(o.material)}" list="mat-list2" class="w-l"><datalist id="mat-list2">${[...new Set(S.stock.map(s => s.material).concat(S.offcuts.map(x => x.material)))].map(m => `<option value="${esc(m)}">`).join('')}</datalist></label>
+    <label class="f">Material${selOther('material', o.material, MATERIALS.concat(S.stock.map(s => s.material), S.offcuts.map(x => x.material)))}</label>
     <label class="f">Thickness (mm)<input name="thickness" type="text" inputmode="decimal" class="num" value="${o.thickness}"></label>
-    <label class="f">Finish<input name="finish" value="${esc(o.finish || '')}" class="w-l"></label>
+    <label class="f">Finish${selOther('finish', o.finish || '', FINISHES.concat(finishes()), { none: 'None / not specified', ph: 'Type a finish' })}</label>
     <label class="f">Rack / location<input name="location" value="${esc(o.location || '')}"></label>
     ${rect ? `<label class="f">Width (mm)<input name="w" type="text" inputmode="decimal" class="num" value="${+o.bw.toFixed(2)}"></label><label class="f">Height (mm)<input name="h" type="text" inputmode="decimal" class="num" value="${+o.bh.toFixed(2)}"></label>` : '<span class="muted" style="font-size:12px;margin-bottom:9px">Size can only be edited for rectangular offcuts.</span>'}
     <div class="row" style="justify-content:flex-end;width:100%;margin-top:8px"><button type="button" class="btn" data-act="modal-cancel">Cancel</button><button class="btn p">Save</button></div></form></div>`;
@@ -13165,6 +13173,7 @@ document.addEventListener('change', e => {
   else if (a === 'job-combo') { invalidate(RUN ? 'material changed' : ''); const v = t.value, i = v.lastIndexOf('|'); S.job.material = v.slice(0, i); S.job.thickness = +v.slice(i + 1); save(); render(); }
   else if (a === 'job-finish') { invalidate(RUN ? 'finish changed' : ''); S.job.finish = t.value; save(); render(); }
   else if (a === 'imp-pref') { const k = t.dataset.k; if (k === 'importQty') { const r = readField(t, FIELDS.pqty); if (!r.ok) return; S.ui.importQty = r.v; } else S.ui.importUnits = t.value; save(); }
+  else if (a === 'so-select') { const f = t.closest('form'), inp = f && f[t.dataset.for]; if (inp) { if (t.value === '__other') { inp.hidden = false; inp.value = ''; inp.focus(); } else { inp.hidden = true; inp.value = t.value; fieldError(inp, null); } } }
   else if (a === 'stock-preset') { const f = $('#f-stock'); if (!t.value || !f) return; const [w, h] = t.value.split('x'); f.w.value = w; f.h.value = h; fieldError(f.w, null); fieldError(f.h, null); t.value = ''; }
   else if (a === 'imp-units') { const x = PENDING[+t.dataset.x]; x.scale = parseFloat(t.value) || 1; flattenItem(x); showImport(); }
   else if (a === 'imp-qty' || a === 'imp-name' || a === 'imp-inc') { const r = PENDING[+t.dataset.x].rows[+t.dataset.r]; if (a === 'imp-qty') { const q = readField(t, FIELDS.pqty); if (q.ok) r.part.qty = q.v; } else if (a === 'imp-name') r.part.name = t.value.trim() || r.part.name; else { r.include = t.checked; showImport(); } }
