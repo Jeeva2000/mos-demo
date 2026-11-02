@@ -12618,33 +12618,24 @@ function render() {
 }
 
 function vDash() {
-  const t = totals();
-  const tot = t.ocUsedArea + t.newArea, ocShare = tot ? t.ocUsedArea / tot : 0;
-  const recent = S.jobs.slice(0, 12);
-  const empty = !S.stock.length && !S.jobs.length;
-  return `<h1>Dashboard</h1><p class="sub">How well every plate is being used — offcuts are tracked so the next order uses them first.</p>
+  const t = totals(), empty = !S.stock.length && !S.jobs.length, rows = new Map();
+  const row = (m, th) => { const k = matKey(m, th); if (!rows.has(k)) rows.set(k, { material: String(m).trim(), thickness: +th, plates: 0, scrap: 0, part: 0, used: 0, saved: 0 }); return rows.get(k); };
+  S.stock.forEach(s => { row(s.material, s.thickness).plates += +s.qty || 0; });
+  (S.scrap || []).forEach(x => { row(x.material, x.thickness).scrap += +x.area || 0; });
+  S.jobs.forEach(j => { const r = row(j.material, j.thickness); r.part += j.partArea || 0; r.used += (j.sheetArea || 0) - (j.leftArea || 0); r.saved += j.savedINR || 0; });
+  const list = [...rows.values()].sort((a, b) => a.material.localeCompare(b.material) || a.thickness - b.thickness);
+  return `<h1>Dashboard</h1><p class="sub">Your stock, scrap and savings at a glance.</p>
   ${empty ? `<div class="card" style="margin-bottom:16px"><h2>Get started</h2><p class="muted">Add your plate stock, add parts (or upload DXF), nest, and confirm the cut. Every usable leftover is saved as a labelled offcut and used first on the next order.</p>
   <div class="row"><button class="btn p" data-act="view" data-v="stock">Add plate stock</button><button class="btn" data-act="demo">Load demo data</button></div></div>` : ''}
   <div class="grid g4">
-    <div class="card kpi"><div class="l">New plates used</div><div class="v">${t.plates}</div><div class="s">${t.jobs} cut job${t.jobs === 1 ? '' : 's'} · ${inr(t.cost)} of plate</div></div>
-    <div class="card kpi"><div class="l">Material utilisation</div><div class="v">${pct(t.util)}</div><div class="s">part area ÷ material consumed (excl. saved offcuts)</div></div>
-    <div class="card kpi"><div class="l">Est. saved by reusing offcuts</div><div class="v" style="color:var(--ok)">${inr(t.saved)}</div><div class="s">${t.ocUsed} offcut${t.ocUsed === 1 ? '' : 's'} reused</div></div>
-    <div class="card kpi"><div class="l">Offcuts on the rack</div><div class="v">${t.ocAvail}</div><div class="s">${area(t.ocAvailArea)} · worth ${inr(t.ocAvailValue)}</div></div>
+    <div class="card kpi"><div class="l">Plates in stock</div><div class="v">${t.stockPlates}</div></div>
+    <div class="card kpi" id="kpi-scrap"><div class="l">Scrap</div><div class="v" style="color:var(--bad)">${area(t.scrapArea)}</div><div class="s">${t.scrapValue ? inr(t.scrapValue) + ' lost' : ''}</div></div>
+    <div class="card kpi"><div class="l">Utilisation</div><div class="v">${t.jobs ? pct(t.util) : '—'}</div></div>
+    <div class="card kpi"><div class="l">Money saved</div><div class="v" style="color:var(--ok)">${inr(t.saved)}</div></div>
   </div>
-  <div class="grid g2" style="margin-top:16px">
-    <div class="card"><h2>Sheet area cut from offcuts vs new plates</h2>
-      <div class="bar"><i style="width:${ocShare * 100}%;background:var(--acc)"></i><i style="width:${(1 - ocShare) * 100}%;background:#94a3b8"></i></div>
-      <div class="legend"><span style="--c:var(--acc)">Offcuts reused: <b>${area(t.ocUsedArea)}</b> (${pct(ocShare)})</span><span style="--c:#94a3b8">New plates: <b>${area(t.newArea)}</b></span></div>
-    </div>
-    <div class="card"><h2>Stock on hand</h2><div class="row" style="gap:28px"><div class="kpi"><div class="l">Plates</div><div class="v">${t.stockPlates}</div><div class="s">${inr(t.stockValue)}</div></div>
-      <div class="kpi"><div class="l">Offcut area</div><div class="v">${area(t.ocAvailArea)}</div><div class="s">${t.ocAvail} pieces</div></div>
-      <div class="kpi" id="kpi-scrap"><div class="l">Scrapped</div><div class="v" style="color:var(--bad)">${area(t.scrapArea)}</div><div class="s">${t.scrapN} piece${t.scrapN === 1 ? '' : 's'} · ${inr(t.scrapValue)}</div></div>
-      <div style="margin-left:auto"><button class="btn p" data-act="view" data-v="nest">New cut job →</button></div></div></div>
-  </div>
-  <div class="card" style="margin-top:16px"><h2>Cut history</h2>${recent.length ? `<table><thead><tr><th>Job</th><th>Date</th><th>Material</th><th class="n">Parts</th><th>Sheets</th><th class="n">Utilisation</th><th class="n">Offcuts made</th><th class="n">Saved</th></tr></thead><tbody>
-  ${recent.map(j => `<tr><td class="mono"><b>${esc(j.id)}</b></td><td>${today(j.date)}</td><td>${esc(j.material)} ${j.thickness} mm</td><td class="n">${j.placed}${j.placed < j.total ? ' / ' + j.total : ''}</td>
-  <td>${j.sheets.map(s => `<span class="pill ${s.kind === 'offcut' ? 'acc' : ''}">${esc(s.ref)}</span>`).join(' ')}</td><td class="n">${pct((j.sheetArea - j.leftArea) > 0 ? j.partArea / (j.sheetArea - j.leftArea) : 0)}</td>
-  <td class="n">${(j.created || []).length}</td><td class="n">${inr(j.savedINR)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No cut jobs yet.</div>'}</div>`;
+  <div class="card" style="margin-top:16px"><div class="row" style="justify-content:space-between;align-items:center"><h2 style="margin:0">By material</h2><button class="btn p" data-act="view" data-v="nest">New cut job →</button></div>
+  ${list.length ? `<table style="margin-top:10px"><thead><tr><th>Material</th><th class="n">Plates in stock</th><th class="n">Scrap</th><th class="n">Utilisation</th><th class="n">Money saved</th></tr></thead><tbody>
+  ${list.map(r => `<tr><td><b>${esc(r.material)}</b> · ${num(r.thickness, 3)} mm</td><td class="n">${r.plates}</td><td class="n">${r.scrap ? area(r.scrap) : '—'}</td><td class="n">${r.used > 0 ? pct(r.part / r.used) : '—'}</td><td class="n">${r.saved ? inr(r.saved) : '—'}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">Nothing yet. Add plate stock to begin.</div>'}</div>`;
 }
 
 const FINISHES = ['Mill finish', 'Hot rolled / pickled & oiled', 'Cold rolled', '2B', 'Brushed #4', 'Galvanised', 'Anodised', 'PVC film one side', 'Gloss', 'Matte', '3K twill gloss', '3K twill matte', 'UD matte'];
