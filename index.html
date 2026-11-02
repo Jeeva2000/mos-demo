@@ -11198,7 +11198,7 @@ const CP = CL.Clipper, S = 1000, EPS = 5; // 1 unit = 1 µm; EPS: smallest arc t
 const NZ = CL.PolyFillType.pftNonZero, EO = CL.PolyFillType.pftEvenOdd;
 const ABORT = { abort: true }; // thrown inside an evaluation when its hard deadline has passed
 const NFP_CAP = 1e6; // cached NFP vertices per engine before the NFP cache is flushed (~120 MB)
-const REPAIR_ALLOW = 300, INIT_TIMEOUT = 5000; // ms a final repair may run past the time budget
+const RBMAX = 150, MODES = [0, 1, 2, 3, 4, 5], REPAIR_ALLOW = 300, INIT_TIMEOUT = 5000; // RBMAX: above this many (type, rotation) pairs best-rotation search is too slow; REPAIR_ALLOW: ms a final repair may run past the budget
 
 /* ---------------- geometry helpers ---------------- */
 function rotPt(x, y, deg) {
@@ -11354,6 +11354,17 @@ function degenerateWhy(p) {
   if (!paths.length || !(a >= 1)) return 'outline has no area (zero-width or collinear loop)';
   return null;
 }
+/* rotations that give the same outline (rectangles at 180°, circles, any part with that symmetry) are tried once */
+function dedupeRots(p, rots) {
+  if (rots.length < 2) return rots;
+  const seen = new Set(), out = [];
+  for (const r of rots) {
+    const L = rotLoops(p.loops, r.deg), pts = L.flat(), x0 = Math.min(...pts.map(q => q[0])), y0 = Math.min(...pts.map(q => q[1]));
+    const sig = L.map(l => l.map(q => Math.round((q[0] - x0) * 50) + ',' + Math.round((q[1] - y0) * 50)).sort().join(';')).join('|');
+    if (seen.has(sig)) continue; seen.add(sig); out.push(r);
+  }
+  return out;
+}
 function prepare(opts) {
   const st = Object.assign({}, MOS.DEFAULTS, opts.settings || {});
   const { parts, stock, offcuts, material, thickness, finish } = opts;
@@ -11361,7 +11372,8 @@ function prepare(opts) {
   const rc = {}, types = [], inst = [], bad = [];
   (parts || []).filter(p => +p.qty > 0 && p.loops && p.loops.length).forEach(p => {
     const why = degenerateWhy(p); if (why) { bad.push({ id: p.id, name: p.name, qty: Math.ceil(+p.qty), reason: why }); return; }
-    const rots = p.allowedRots ? p.allowedRots.map(d => ({ deg: d, pref: true })) : MOS.candidateRots(p, st, rc).map(r => ({ deg: r.deg, pref: r.pref }));
+    let rots = p.allowedRots ? p.allowedRots.map(d => ({ deg: d, pref: true })) : MOS.candidateRots(p, st, rc).map(r => ({ deg: r.deg, pref: r.pref }));
+    rots = dedupeRots(p, rots);
     const L0 = p.loops[0], rect = p.loops.length === 1 && L0.length === 4 && L0.every(q => (Math.abs(q[0]) < 1e-9 || Math.abs(q[0] - p.w) < 1e-9) && (Math.abs(q[1]) < 1e-9 || Math.abs(q[1] - p.h) < 1e-9));
     const t = types.length; types.push({ id: p.id, name: p.name, area: p.area, w: p.w, h: p.h, loops: p.loops, circles: p.circles || [], rots, rect, qty: +p.qty });
     for (let q = 0; q < +p.qty; q++) inst.push(t);
@@ -11384,14 +11396,15 @@ function Engine(P, opt) {
   this.P = P; this.box = !!opt.box; this.pc = new Map(); this.shapes = new Map(); this.nfps = new Map(); this.nfpVerts = 0; this.ifps = new Map(); this.kerfs = new Map(); this.sheets = [];
   this.stats = { nfp: 0, ifp: 0, evals: 0 }; this.hard = Infinity; this.soft = Infinity;
   this.allRect = this.box || P.allRect;
-  this.arcU = Math.max(EPS, Math.min(50, Math.round(P.tol * S / 4)));
+  this.arcU = Math.max(EPS, Math.min(100, Math.round(P.tol * S / 2)));
   const st = P.st, kerf = +st.kerf || 0, rU = Math.round(P.gap / 2 * S);
   P.sheets.forEach((SH, i) => {
     const margin = Math.max(0, SH.kind === 'offcut' ? +st.offcutMargin || 0 : +st.margin || 0), mU = Math.round(margin * S);
     const paths = normalize(SH.loops.map(toI)), bb = bboxI(paths);
     let regions, dI = null;
-    if (mU >= rU) regions = treeRegions(offsetI(paths, -(mU - rU), P.tol / 2, true, true));
-    else if (paths.length === 1 && isAxisRect(paths[0])) { const g = rU - mU; regions = [{ outer: rectPath({ minX: bb.minX - g, minY: bb.minY - g, maxX: bb.maxX + g, maxY: bb.maxY + g }), holes: [] }]; }
+    const sl = mU > 0 ? 3 : 0; // 3 µm of slack so exact fits survive integer rounding (never when the margin is 0: nothing may leave the sheet)
+    if (mU >= rU) regions = treeRegions(offsetI(paths, -(mU - rU) + sl, P.tol / 2, true, true));
+    else if (paths.length === 1 && isAxisRect(paths[0])) { const g = rU - mU + sl; regions = [{ outer: rectPath({ minX: bb.minX - g, minY: bb.minY - g, maxX: bb.maxX + g, maxY: bb.maxY + g }), holes: [] }]; }
     else { regions = treeRegions(boolI(UNION, paths, [], true)); dI = mU; }
     const rbb = bboxI(regions.map(R => R.outer));
     this.sheets.push({ i, paths, regions, bb, rbb, dI, rect: dI == null && regions.length === 1 && !regions[0].holes.length && isAxisRect(regions[0].outer) && paths.length === 1 });
@@ -11403,6 +11416,11 @@ Engine.prototype.boxEngine = function () { return this.boxE || (this.boxE = new 
 Engine.prototype.shapeD = function (t, deg, dU, main) {
   const key = t + '|' + deg + '|' + dU + (main ? '' : 'x'); let s = this.shapes.get(key); if (s) return s;
   const P = this.P, T = P.types[t], tol = P.tol;
+  if (deg && deg % 90 === 0) { // quarter turns of a grown outline are exact: rotate the 0° shape instead of growing again
+    const b = this.shapeD(t, 0, dU, main), outer = rotI([b.outer], deg)[0];
+    s = { pc: this.pc, t, deg, d: b.d, outer, neg: outer.map(p => ({ X: -p.X, Y: -p.Y })), holes: rotI(b.holes, deg), bb: bboxI([outer]), a0: outer[0], area: b.area, rect: b.rect };
+    this.shapes.set(key, s); return s;
+  }
   DPDEV = 0; const loops = rotLoops(T.loops, deg).map(l => simplifyClosed(l, tol)); let dev = Math.sqrt(DPDEV);
   let paths = normalize(loops.map(toI));
   if (!paths.length) { paths = normalize(rotLoops(T.loops, deg).map(toI)); dev = 0; }
@@ -11428,9 +11446,10 @@ Engine.prototype.nfp = function (tB, dB, tA, dA) {
   let base = this.nfps.get(rkey);
   if (!base) {
     if (Date.now() > this.hard) throw ABORT;
-    const A = this.shape(tA, rel), B = this.shape(tB, 0);
-    const paths = minkSolid(A.neg, B.outer, this.pc); this.stats.nfp++;
-    base = { paths, bb: bboxI(paths) }; this.cacheNfp(rkey, base);
+    const alt = rel % 90 === 0 && (tA !== tB || (rel !== 0 && rel !== 180)) ? this.nfps.get(tA + '|0|' + tB + '|' + ((360 - rel) % 360)) : null;
+    if (alt) { const paths = rotI(alt.paths, (180 + rel) % 360); base = { paths, bb: bboxI(paths) }; } // N(i,j,r) = R(r + 180°) N(j,i,-r)
+    else { const A = this.shape(tA, rel), B = this.shape(tB, 0), paths = minkSolid(A.neg, B.outer, this.pc); this.stats.nfp++; base = { paths, bb: bboxI(paths) }; }
+    this.cacheNfp(rkey, base);
   }
   if (!dB) n = base; else { const paths = rotI(base.paths, dB); n = { paths, bb: bboxI(paths) }; }
   this.cacheNfp(key, n); return n;
@@ -11519,7 +11538,11 @@ SheetState.prototype.score = function (A, X, Y, ind) {
   const sb = this.E.sheets[this.si].bb, x0 = X + A.bb.minX, x1 = X + A.bb.maxX, y0 = Y + A.bb.minY, y1 = Y + A.bb.maxY, e = this.env;
   const ex0 = e ? Math.min(e.x0, x0) : x0, ex1 = e ? Math.max(e.x1, x1) : x1, ey0 = e ? Math.min(e.y0, y0) : y0, ey1 = e ? Math.max(e.y1, y1) : y1;
   const W = sb.maxX - sb.minX, H = sb.maxY - sb.minY, ew = ex1 - ex0, eh = ey1 - ey0;
-  const D0 = Math.max(W, H), env = ind.mode === 1 ? ew * H + 0.1 * ew * eh : ind.mode === 2 ? eh * W + 0.1 * ew * eh : ind.mode === 3 ? (2 * ew + eh) * D0 : ind.mode === 4 ? (ew + 2 * eh) * D0 : ind.mode === 5 ? (2 * ew + eh) * D0 + (x1 - sb.minX) * D0 * 0.5 : ew * eh;
+  const D0 = Math.max(W, H);
+  if (ind.mode === 6) return x1 * D0 + 0.5 * ((ind.corner & 2) ? sb.maxY - y1 : y0 - sb.minY) * D0; // leftmost right edge first (bottom-left fill)
+  if (ind.mode === 7) return x0 * D0 + 0.5 * ((ind.corner & 2) ? sb.maxY - y1 : y0 - sb.minY) * D0; // leftmost left edge first
+  if (ind.mode === 8) return (x1 + x0) * D0 + ((ind.corner & 2) ? sb.maxY - y1 : y0 - sb.minY) * D0 * 0.2; // leftmost centre
+  const env = ind.mode === 1 ? ew * H + 0.1 * ew * eh : ind.mode === 2 ? eh * W + 0.1 * ew * eh : ind.mode === 3 ? (2 * ew + eh) * D0 : ind.mode === 4 ? (ew + 2 * eh) * D0 : ind.mode === 5 ? (2 * ew + eh) * D0 + (x1 - sb.minX) * D0 * 0.5 : ew * eh;
   const gx = (ind.corner & 1) ? sb.maxX - x1 : x0 - sb.minX, gy = (ind.corner & 2) ? sb.maxY - y1 : y0 - sb.minY;
   const D = Math.max(W, H);
   return env + 0.05 * D * (ind.mode === 1 ? gx * 3 + gy : ind.mode === 2 ? gx + gy * 3 : gx + gy);
@@ -11587,15 +11610,18 @@ Engine.prototype.fillSheetG = function* (si, order, ind, ocRank) {
   const P = this.P, SS = new SheetState(this, si), rectMode = this.allRect && this.sheets[si].rect, rest = [];
   if (ocRank != null && ind.cs && ind.cs[ocRank] != null) ind = Object.assign({}, ind, { corner: ind.cs[ocRank] }); // per-offcut corner gene
   const SH = P.sheets[si], leftAware = !rectMode && ocRank != null && P.st.offcutStyle !== 'clean' && P.st.objective !== 'strip' && P.st.leftoverAware !== false && ind.la !== 0; // gene la=0: plain gravity (can pack tighter)
+  const indG = ind;
   for (const i of order) {
     yield 0;
+    ind = indG;
     if (ocRank != null && ind.sh && ind.sh[i] > ocRank) { rest.push(i); continue; } // gene: keep this part off the smaller offcuts
     const t = P.inst[i], T = P.types[t], g = (ind.rot[i] | 0) % T.rots.length; let pos = null, deg = 0;
+
     if (leftAware && T.area >= 0.05 * SH.area) {
       // Keep-whole-plate on an offcut: try the part in every corner of the feasible region (all rotations) and keep the
       // placement whose leftover stays in ONE piece with the largest free rectangle (then the gene's own gravity choice).
       let bestC = null;
-      for (let k = 0; k < T.rots.length && !bestC; k++) { const d = T.rots[(g + k) % T.rots.length].deg; // gene's rotation (first that fits); the GA mutates rotations
+      for (let k = 0; k < T.rots.length && (!bestC || ind.rb !== 0); k++) { const d = T.rots[(g + k) % T.rots.length].deg; // gene's rotation first, then the others (rb=0: stop at the first that fits)
         for (const c of SS.cornerCands(t, d, ind)) { const info = this.skeletonInfo(si, SS.placed.concat([{ t, deg: d, X: c.X, Y: c.Y }]));
           // first part on an irregular offcut: prefer a true outer corner of the material (touching two outer edges), then the gene's choice
           const A = this.shape(t, d), sb = this.sheets[si].bb, cd = SS.placed.length ? 0 : Math.min(...[[sb.minX, sb.minY], [sb.maxX, sb.minY], [sb.minX, sb.maxY], [sb.maxX, sb.maxY]].map(([qx, qy]) =>
@@ -11604,7 +11630,11 @@ Engine.prototype.fillSheetG = function* (si, order, ind, ocRank) {
           if (!bestC || better(key, bestC.key)) bestC = { key, c, d }; } }
       if (bestC) { pos = bestC.c; deg = bestC.d; }
     }
-    for (let k = 0; k < T.rots.length && !pos; k++) { deg = T.rots[(g + k) % T.rots.length].deg; pos = rectMode ? (this.shape(t, deg).rect ? SS.rectPlace(t, deg, ind) : null) : SS.tryPlace(t, deg, ind); }
+    if (!pos) { // every rotation is tried (gene order first, ties go to the earlier one): the rotation with the best placement score wins (rb=0: first one that fits)
+      let bestR = null;
+      for (let k = 0; k < T.rots.length; k++) { const d = T.rots[(g + k) % T.rots.length].deg, p2 = rectMode ? (this.shape(t, d).rect ? SS.rectPlace(t, d, ind) : null) : SS.tryPlace(t, d, ind);
+        if (!p2) continue; if (!bestR || p2.s < bestR.pos.s) bestR = { pos: p2, deg: d }; if (ind.rb === 0) break; }
+      if (bestR) { pos = bestR.pos; deg = bestR.deg; } }
     if (!pos) { rest.push(i); continue; }
     if (rectMode) { SS.rectCommit(t, deg, pos.X, pos.Y); SS.placed.push({ inst: i, t, deg, X: pos.X, Y: pos.Y, owner: -1 }); const A = this.shape(t, deg), e = SS.env, x0 = pos.X + A.bb.minX, x1 = pos.X + A.bb.maxX, y0 = pos.Y + A.bb.minY, y1 = pos.Y + A.bb.maxY; SS.env = e ? { x0: Math.min(e.x0, x0), x1: Math.max(e.x1, x1), y0: Math.min(e.y0, y0), y1: Math.max(e.y1, y1) } : { x0, x1, y0, y1 }; }
     else SS.commit(i, t, deg, pos.X, pos.Y, pos.c.owner);
@@ -11617,14 +11647,14 @@ Engine.prototype.skeletonInfo = function (si, placed) {
   for (const q of placed) for (const K of this.kerfShape(q.t, q.deg)) cut.push(K.map(p => ({ X: p.X + q.X, Y: p.Y + q.Y })));
   const tree = boolI(DIFF, SH.paths, cut, true), regs = treeRegions(tree);
   const minSize = Math.max(0, +st.minOffcut || 0), minArea = Math.max(+st.minOffcutArea || 0, minSize * minSize) * S * S;
-  let pieces = 0; const keepLoops = [];
+  let pieces = 0, left = 0; const keepLoops = [];
   for (const R of regs) { const a = CP.Area(R.outer) + R.holes.reduce((s, h) => s + CP.Area(h), 0); if (a < minArea) continue;
     if (minSize > 0 && a < 25 * minArea && !offsetI([R.outer].concat(R.holes), -Math.round(minSize / 2 * S), 1).length) continue;
-    pieces++; keepLoops.push(toF(R.outer)); R.holes.forEach(h => keepLoops.push(toF(h))); }
+    pieces++; left += a; keepLoops.push(toF(R.outer)); R.holes.forEach(h => keepLoops.push(toF(h))); }
   const W = SH.bb.maxX / S, H = SH.bb.maxY / S, res = Math.max(W, H) / 90, cols = Math.ceil(W / res), rows = Math.ceil(H / res);
   const m = keepLoops.length ? MOS.rasterFill(keepLoops, 0, 0, res, cols, rows) : new Uint8Array(cols * rows);
   const fr = MOS.freeRectOf(m, cols, rows, res);
-  return { pieces, freeRect: fr.area };
+  return { pieces, freeRect: fr.area, left: left / (S * S) };
 };
 
 /* sequential max-fill (gene seq=1): fill this sheet as full as possible before moving on. Tries several part orders /
@@ -11700,11 +11730,11 @@ Engine.prototype.repairResG = function* (res, ind) {
 };
 Engine.prototype.finishRes = function (used, remaining) {
   const P = this.P, st = P.st;
-  const whole = st.offcutStyle !== 'clean'; let pieces = 0, envS = 0, frS = 0, frM = 0, totA = 0;
+  const whole = st.offcutStyle !== 'clean'; let pieces = 0, envS = 0, frS = 0, frM = 0, totA = 0, leftS = 0;
   for (const u of used) {
     const SH = P.sheets[u.si], e = u.SS.env, envA = (e.x1 - e.x0) * (e.y1 - e.y0) / (S * S);
     const k = st.objective === 'strip' ? { pieces: 1, freeRect: 0 } : this.skeletonInfo(u.si, u.SS.placed); u.info = k; pieces += Math.max(0, k.pieces - 1);
-    envS += envA; frS += k.freeRect; frM = Math.max(frM, k.freeRect); totA += SH.area;
+    leftS += k.left || 0; envS += envA; frS += k.freeRect; frM = Math.max(frM, k.freeRect); totA += SH.area;
   }
   // compaction: small part envelopes, big free rectangles (the biggest one counts double)
   let comp = totA ? (envS - 0.5 * frS - frM) / totA : 0;
@@ -11712,9 +11742,12 @@ Engine.prototype.finishRes = function (used, remaining) {
   const placed = P.inst.length - remaining.length;
   const newPlate = used.reduce((a, u) => a + (P.sheets[u.si].kind === 'plate' ? P.sheets[u.si].area : 0), 0), tot = used.reduce((a, u) => a + P.sheets[u.si].area, 0);
   // sheet-by-sheet maximal fill: with the same sheets, more part area on sheet 1, then sheet 2, ... (the last sheet holds only overflow)
-  const fill = used.map(u => Math.round(u.SS.placed.reduce((a, q) => a + P.types[q.t].area, 0)));
+  const fill = used.map(u => Math.round(u.SS.placed.reduce((a, q) => a + P.types[q.t].area, 0) ));
   // exact outlines beat the bounding-box layout on a tie
-  const key = [placed, -Math.round(newPlate), -used.length, -Math.round(tot)].concat(st.objective === 'strip' ? [] : fill, [this.box ? 0 : 1, whole ? -pieces : 0, -comp]);
+  // strip objective: length first, then the mean right edge of the parts (gives the search a gradient across layouts of equal length)
+  let tail = [whole ? -pieces : 0, Math.round(leftS / (0.001 * totA || 1)), -comp]; // saved leftover area (net utilisation) in 0.1 % steps before compactness
+  if (st.objective === 'strip') { let sx = 0, n = 0; for (const u of used) for (const q of u.SS.placed) { sx += (q.X + this.shape(q.t, q.deg).bb.maxX) / S; n++; } tail = [-Math.round(comp * 20) / 20, -(n ? sx / n : 0)]; }
+  const key = [placed, -Math.round(newPlate), -used.length, -Math.round(tot)].concat(st.objective === 'strip' ? [] : fill, [this.box ? 0 : 1], tail);
   return { key, sheets: used.map(u => ({ si: u.si, rank: u.rank, pl: u.SS.placed.map(q => [q.inst, q.t, q.deg, q.X, q.Y, q.owner]), pieces: u.info.pieces, freeRect: u.info.freeRect, env: u.SS.env })), unplaced: remaining };
 };
 /* generator for a search task: normal individual, bounding-box individual (ind.box) or repair of a layout (ind.base) */
@@ -11743,18 +11776,31 @@ function Search(P, opt) {
   const seeds = [];
   // big jobs: a bounding-box layout first (MaxRects on each part's clearance box): valid, ready in milliseconds
   if (P.st.objective !== 'strip' && !P.allRect && (P.types.length >= 10 || n >= 150)) seeds.push({ order: byArea, rot: z(), corner: 0, mode: 0, box: 1 });
-  for (const mode of [0, 1, 2, 3, 4, 5]) for (const corner of [0, 1, 2, 3]) seeds.push({ order: byArea, rot: z(), corner, mode });
-  seeds.push({ order: byDim, rot: z(), corner: 0, mode: 0 });
-  const alt = z().map((_, i) => P.inst[i] % 2); seeds.push({ order: byArea, rot: alt, corner: 0, mode: 0 });
-  if (P.st.objective !== 'strip') for (const corner of [0, 1, 2, 3]) for (const mode of [0, 3]) seeds.push({ order: byArea, rot: z(), corner, mode, seq: 1 }); // sequential max-fill seeds
+  const seq = P.st.objective !== 'strip';
+  if (this.nOc) { // offcuts: every corner matters (the leftover shape depends on it)
+    for (const mode of MODES) for (const corner of [0, 1, 2, 3]) seeds.push({ order: byArea, rot: z(), corner, mode });
+    seeds.push({ order: byDim, rot: z(), corner: 0, mode: 0 });
+    const alt = z().map((_, i) => P.inst[i] % 2); seeds.push({ order: byArea, rot: alt, corner: 0, mode: 0 });
+    if (seq) for (const corner of [0, 1, 2, 3]) for (const mode of [0, 3]) seeds.push({ order: byArea, rot: z(), corner, mode, seq: 1 });
+  } else { // plates are symmetric: first every score mode at one corner (plain and sequential max-fill), the mirrored corners afterwards
+    if (P.types.length >= 12 && n >= 100) seeds.push({ order: byArea, rot: z(), corner: 0, mode: 0, rb: 0 }); // many shapes: first fit is cheap, an exact layout exists early; best-rotation layouts (better, slower) follow
+    for (const mode of MODES) seeds.push({ order: byArea, rot: z(), corner: 0, mode });
+    if (seq) for (const mode of [0, 3]) seeds.push({ order: byArea, rot: z(), corner: 0, mode, seq: 1 });
+    for (const mode of [0, 3]) seeds.push({ order: byArea, rot: z(), corner: 0, mode, rb: 0 });
+    seeds.push({ order: byDim, rot: z(), corner: 0, mode: 0 });
+    const alt = z().map((_, i) => P.inst[i] % 2); seeds.push({ order: byArea, rot: alt, corner: 0, mode: 0 });
+    for (const corner of [1, 2, 3]) for (const mode of MODES) seeds.push({ order: byArea, rot: z(), corner, mode });
+    if (seq) for (const corner of [1, 2, 3]) for (const mode of [0, 3]) seeds.push({ order: byArea, rot: z(), corner, mode, seq: 1 });
+  }
   if (this.nOc) seeds.slice().forEach(x => { if (!x.box) seeds.push(Object.assign({}, x, { la: 0 })); }); // also plain gravity on offcuts
+  const nRot = P.types.reduce((a, T) => a + T.rots.length, 0); if (nRot > RBMAX) seeds.forEach(x => { x.rb = 0; }); // many shapes: every rotation of every part against every placed part is too slow, first fit instead
   this.queue = seeds.filter(s => this.fresh(s));
 }
-Search.prototype.sig = function (ind) { const P = this.P; return ind.order.map(i => P.inst[i] + ':' + ((ind.rot[i] | 0) % P.types[P.inst[i]].rots.length) + (ind.sh && ind.sh[i] ? 's' + ind.sh[i] : '')).join(',') + '|' + ind.corner + ind.mode + (ind.cs && ind.cs.some(x => x != null) ? '|' + ind.cs.join('') : '') + (ind.la === 0 && this.nOc ? '|g' : '') + (ind.seq ? '|q' : '') + (ind.repair ? '|r' : '') + (ind.box ? '|b' : ''); };
+Search.prototype.sig = function (ind) { const P = this.P; return ind.order.map(i => P.inst[i] + ':' + ((ind.rot[i] | 0) % P.types[P.inst[i]].rots.length) + (ind.sh && ind.sh[i] ? 's' + ind.sh[i] : '')).join(',') + '|' + ind.corner + ind.mode + (ind.cs && ind.cs.some(x => x != null) ? '|' + ind.cs.join('') : '') + (ind.la === 0 && this.nOc ? '|g' : '') + (ind.seq ? '|q' : '') + (ind.repair ? '|r' : '') + (ind.box ? '|b' : '') + (ind.rb === 0 ? '|f' : ''); };
 Search.prototype.fresh = function (ind) { const s = this.sig(ind); if (this.seen.has(s)) return false; this.seen.add(s); return true; };
 Search.prototype.mutate = function (ind, strength) {
   const P = this.P, r = this.rng, n = ind.order.length, nOc = this.nOc;
-  const c = { order: ind.order.slice(), rot: ind.rot.slice(), corner: ind.corner, mode: ind.mode, sh: ind.sh ? ind.sh.slice() : new Array(n).fill(0), cs: ind.cs ? ind.cs.slice() : null, la: ind.la, seq: ind.seq && this.rng() < 0.35 ? 1 : 0 };
+  const c = { order: ind.order.slice(), rot: ind.rot.slice(), rb: ind.rb, corner: ind.corner, mode: ind.mode, sh: ind.sh ? ind.sh.slice() : new Array(n).fill(0), cs: ind.cs ? ind.cs.slice() : null, la: ind.la, seq: ind.seq && this.rng() < 0.35 ? 1 : 0 };
   const k = Math.max(1, Math.round((strength || 1) * (1 + r() * 2)));
   for (let m = 0; m < k; m++) {
     const u = r();
@@ -11763,7 +11809,7 @@ Search.prototype.mutate = function (ind, strength) {
     } else if (u < 0.5 && n > 1) { const a = (r() * n) | 0, b = (r() * n) | 0, [x] = c.order.splice(a, 1); c.order.splice(b, 0, x); }
     else if (u < 0.78) { const i = c.order[(r() * n) | 0], R = P.types[P.inst[i]].rots.length; if (R > 1) c.rot[i] = (c.rot[i] + 1 + ((r() * (R - 1)) | 0)) % R; }
     else if (u < 0.88) { const t = P.inst[c.order[(r() * n) | 0]], R = P.types[t].rots.length, v = (r() * R) | 0; c.order.forEach(i => { if (P.inst[i] === t) c.rot[i] = v; }); }
-    else if (u < 0.92) { if (nOc && r() < 0.15) c.la = c.la === 0 ? 1 : 0; else if (nOc && r() < 0.6) { c.cs = c.cs || new Array(nOc).fill(null); c.cs[(r() * nOc) | 0] = (r() * 4) | 0; } else c.corner = (r() * 4) | 0; } // corner swap: whole job or one offcut
+    else if (u < 0.92) { if (r() < 0.08) c.rb = c.rb === 0 ? 1 : 0; else if (nOc && r() < 0.15) c.la = c.la === 0 ? 1 : 0; else if (nOc && r() < 0.6) { c.cs = c.cs || new Array(nOc).fill(null); c.cs[(r() * nOc) | 0] = (r() * 4) | 0; } else c.corner = (r() * 4) | 0; } // corner swap: whole job or one offcut
     else if (u < 0.96 || nOc < 2) c.mode = (r() * 6) | 0;
     else { const i = c.order[(r() * n) | 0]; c.sh[i] = c.sh[i] ? 0 : 1 + ((r() * (nOc - 1)) | 0); } // keep this part off the smaller offcuts (needs >= 2 offcuts)
   }
@@ -11773,7 +11819,7 @@ Search.prototype.cross = function (a, b) {
   const n = a.order.length, cut = (this.rng() * n) | 0, head = a.order.slice(0, cut), inHead = new Set(head);
   const order = head.concat(b.order.filter(i => !inHead.has(i))), rot = a.rot.map((v, i) => inHead.has(i) ? v : b.rot[i]);
   const sa = a.sh || [], sb = b.sh || [], sh = a.order.map((_, i) => (inHead.has(i) ? sa[i] : sb[i]) || 0);
-  return { order, rot, sh, corner: this.rng() < 0.5 ? a.corner : b.corner, mode: this.rng() < 0.5 ? a.mode : b.mode, cs: (this.rng() < 0.5 ? a.cs : b.cs) || null, la: this.rng() < 0.5 ? a.la : b.la, seq: this.rng() < 0.5 ? a.seq : b.seq };
+  return { order, rot, rb: this.rng() < 0.5 ? a.rb : b.rb, sh, corner: this.rng() < 0.5 ? a.corner : b.corner, mode: this.rng() < 0.5 ? a.mode : b.mode, cs: (this.rng() < 0.5 ? a.cs : b.cs) || null, la: this.rng() < 0.5 ? a.la : b.la, seq: this.rng() < 0.5 ? a.seq : b.seq };
 };
 Search.prototype.pick = function () { const r = this.rng, p = this.pop; let w = p[(r() * p.length) | 0]; for (let k = 0; k < 2; k++) { const c = p[(r() * p.length) | 0]; if (better(c.res.key, w.res.key)) w = c; } return w; };
 /* repair task for the current best layout: re-uses its placements (ind.base), only moves parts off the last sheet */
@@ -11802,7 +11848,7 @@ Search.prototype.next = function (frac) {
   return null; // search space exhausted
 };
 Search.prototype.report = function (ind, res) {
-  this.evals++;
+  this.evals++; if (!(ind && ind.box)) this.exactDone = true; // an exact (non bounding-box) layout has been evaluated
   if (ind && ind.base) { ind = Object.assign({}, ind); delete ind.base; }
   const isBest = !this.best || better(res.key, this.best.res.key);
   if (isBest) { this.best = { ind, res }; this.improved++; this.stall = 0; } else this.stall++;
@@ -11819,19 +11865,21 @@ function budgetOf(st, opts) {
   const ms = opts.budgetMs != null ? opts.budgetMs : st.effort === 'custom' ? (+st.effortMs || 10000) : (BUDGET[st.effort] || BUDGET.better);
   // stop early only after this many layouts in a row without improvement; scaled by the number of parallel workers
   const stall = opts.stall != null ? opts.stall : (STALL[st.effort] || STALL.best) * Math.max(1, opts.workers || 1);
-  return { ms, stall, maxIter: opts.maxIter != null ? opts.maxIter : Infinity };
+  return { ms, stall, maxIter: opts.maxIter != null ? opts.maxIter : Infinity, cap: Math.max(opts.capMs || 0, Math.min(60000, Math.max(30000, 4 * ms))) };
 }
 /* next task for a driver: { ind, lim } or null when the search is over. Evaluations get a hard deadline at the end of
    the budget once a layout exists; the final repair may run REPAIR_ALLOW ms past it. */
 function nextTask(Sx, B, t0, stopped) {
   if (stopped) return null;
   const now = Date.now(), el = now - t0;
-  if (Sx.evals && (el >= B.ms || Sx.evals >= B.maxIter || Sx.stall >= B.stall)) {
+  const boxOnly = Sx.best && Sx.best.ind && Sx.best.ind.box && !Sx.exactDone && Sx.evals < B.maxIter && el < B.cap; // only the bounding-box layout so far: the exact search keeps going (up to B.cap)
+  if (Sx.evals && !boxOnly && (el >= B.ms || Sx.evals >= B.maxIter || (Sx.stall >= B.stall && el >= 0.5 * B.ms))) {
     const ind = Sx.finalRepair(); if (!ind) return null;
     const hard = Math.min(t0 + B.ms, now + 1500) + REPAIR_ALLOW; return { ind, lim: { hard, soft: hard - 30 } };
   }
   const ind = Sx.next(Math.max(el / B.ms, Sx.evals / B.maxIter)); if (!ind) return null;
-  return { ind, lim: Sx.best ? { hard: t0 + B.ms, soft: t0 + B.ms - 30 } : null };
+  const end = t0 + (boxOnly ? B.cap : B.ms);
+  return { ind, lim: Sx.best ? { hard: end, soft: end - 30 } : null };
 }
 function searchSync(P, opts) {
   opts = opts || {};
